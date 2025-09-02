@@ -10,4 +10,4 @@ else
 fi
 
 # Run the Python script in the environment without activating
-conda run -n SCSegamba python3 main.py
+conda run --no-capture-output -n SCSegamba python3 main.py > stdout.txt 2> stderr.txt 

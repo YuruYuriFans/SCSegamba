@@ -33,7 +33,7 @@ def get_args_parser():
                         help='Weight ratio for Dice Loss (0.0-1.0), should sum to 1 with BCELoss_ratio')
     parser.add_argument('--Norm_Type', default='GN', type=str,
                         help='Normalization layer type [GN|BN], GN=GroupNorm')
-    parser.add_argument('--dataset_path', default="../data/TUT",
+    parser.add_argument('--dataset_path', default="../CrackSegmentationDataset",
                         help='Root directory path for dataset')
     parser.add_argument('--batch_size_train', type=int, default=1,
                         help='Number of samples per training batch (affects memory usage)')

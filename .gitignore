@@ -5,3 +5,5 @@ __pycache__/
 *.pyd
 */__pycache__/
 /checkpoints
+stderr.txt
+stdout.txt
