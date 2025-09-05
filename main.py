@@ -22,14 +22,27 @@ from eval.evaluate import eval
 from util.logger import get_logger
 from tqdm import tqdm
 from mmengine.optim.scheduler.lr_scheduler import PolyLR
+import pickle
 
+torch.backends.cudnn.benchmark = True  # 🔹 Let cuDNN pick fastest kernels
+
+def save_state(state, filename="state.pkl"):
+    with open(filename, "wb") as f:
+        pickle.dump(state, f)
+
+def load_state(filename="state.pkl"):
+    with open(filename, "rb") as f:
+        return pickle.load(f)
+
+def dice_from_iou(iou):
+    return 2 * iou / (1 + iou)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('SCSEGAMBA FOR CRACK', add_help=False)
 
-    parser.add_argument('--BCELoss_ratio', default=0.83, type=float,
+    parser.add_argument('--BCELoss_ratio', default=0.4, type=float,
                         help='Weight ratio for Binary Cross Entropy Loss (0.0-1.0), should sum to 1 with DiceLoss_ratio')
-    parser.add_argument('--DiceLoss_ratio', default=0.17, type=float,
+    parser.add_argument('--DiceLoss_ratio', default=0.6, type=float,
                         help='Weight ratio for Dice Loss (0.0-1.0), should sum to 1 with BCELoss_ratio')
     parser.add_argument('--Norm_Type', default='GN', type=str,
                         help='Normalization layer type [GN|BN], GN=GroupNorm')
@@ -39,17 +52,17 @@ def get_args_parser():
                         help='Number of samples per training batch (affects memory usage)')
     parser.add_argument('--batch_size_test', type=int, default=1,
                         help='Number of samples per batch')
-    parser.add_argument('--lr_scheduler', type=str, default='PolyLR',
+    parser.add_argument('--lr_scheduler', type=str, default='CosLR',
                         help='Learning rate scheduler type [PolyLR|StepLR|CosLR]')
-    parser.add_argument('--lr', default=5e-4, type=float,
+    parser.add_argument('--lr', default=2e-4, type=float,
                         help='Initial learning rate (base value for schedulers)')
     parser.add_argument('--min_lr', default=1e-6, type=float,
                         help='Minimum learning rate for PolyLR')
-    parser.add_argument('--weight_decay', default=0.01, type=float,
+    parser.add_argument('--weight_decay', default=0.02, type=float,
                         help='Weight decay coefficient for regularization')
-    parser.add_argument('--epochs', default=50, type=int,
+    parser.add_argument('--epochs', default=20, type=int,
                         help='Total number of training epochs to run')
-    parser.add_argument('--start_epoch', default=0, type=int,
+    parser.add_argument('--start_epoch', default=1, type=int,
                         help='Manual epoch number to start training (useful for resuming)')
     parser.add_argument('--lr_drop', default=30, type=int,
                         help='Epoch interval for dropping learning rate in StepLR scheduler')
@@ -65,7 +78,7 @@ def get_args_parser():
                         help='Dataset mode selector')
     parser.add_argument('--serial_batches', action='store_true',
                         help='Disable random shuffling and use sequential batch sampling if enabled')
-    parser.add_argument('--num_threads', default=1, type=int,
+    parser.add_argument('--num_threads', default=10, type=int,
                         help='Number of subprocesses for data loading')
     parser.add_argument('--phase', type=str, default='train',
                         help='Runtime phase selector')
@@ -148,94 +161,107 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         print("---------------------------------------------------------------------------------------")
         print("training epoch start -> ", epoch)
-        train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log_train)
-        lr_scheduler.step()
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            if (epoch + 1) % 1 == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch}.pth')
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
-        print("training epoch finish -> ", epoch)
-        print("---------------------------------------------------------------------------------------")
+        if (epoch + 1) % 2 == 0 or epoch == args.epochs - 1:
+            train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log_train)
+            lr_scheduler.step()
+            if args.output_dir:
+                checkpoint_paths = [output_dir / 'checkpoint.pth']
+                if (epoch + 1) % 1 == 0:
+                    checkpoint_paths.append(output_dir / f'checkpoint{epoch}.pth')
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'args': args,
+                    }, checkpoint_path)
+            print("training epoch finish -> ", epoch)
+            print("---------------------------------------------------------------------------------------")
 
-        print("testing epoch start -> ", epoch)
-        results_path = cur_time + '_Dataset->' + dataset_name
-        save_root = f'./results/{results_path}/results_' + str(epoch)
-        args.phase = 'test'
-        args.batch_size = args.batch_size_test
-        test_dl = create_dataset(args)
-        pbar = tqdm(total=len(test_dl), desc=f"Initial Loss: Pending")
+            print("testing epoch start -> ", epoch)
+            results_path = cur_time + '_Dataset->' + dataset_name
+            save_root = f'./results/{results_path}/results_' + str(epoch)
+            args.phase = 'test'
+            args.batch_size = args.batch_size_test
+            test_dl = create_dataset(args)
+            pbar = tqdm(total=len(test_dl), desc=f"Initial Loss: Pending")
 
-        if not os.path.isdir(save_root):
-            os.makedirs(save_root)
-        with torch.no_grad():
-            model.eval()
-            for batch_idx, (data) in enumerate(test_dl):
-                x = data["image"]
-                target = data["label"]
-                if device != 'cpu':
-                    x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
-                out = model(x)
-                loss = criterion(out, target.float())
-                target = target[0, 0, ...].cpu().numpy()
-                out = out[0, 0, ...].cpu().numpy()
-                root_name = data["A_paths"][0].split("/")[-1][0:-4]
+            if not os.path.isdir(save_root):
+                os.makedirs(save_root)
+            with torch.no_grad():
+                model.eval()
+                for batch_idx, (data) in enumerate(test_dl):
+                    x = data["image"]
+                    target = data["label"]
+                    if device != 'cpu':
+                        x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
+                    out = model(x)
+                    loss = criterion(out, target.float())
+                    target = target[0, 0, ...].cpu().numpy()
+                    out = out[0, 0, ...].cpu().numpy()
+                    root_name = data["A_paths"][0].split("/")[-1][0:-4]
 
-                target = 255 * (target / np.max(target))
-                out = 255 * (out / np.max(out))
+                    target = 255 * (target / np.max(target))
+                    out = 255 * (out / np.max(out))
 
-                # out[out >= 0.5] = 255
-                # out[out < 0.5] = 0
+                    # out[out >= 0.5] = 255
+                    # out[out < 0.5] = 0
 
-                log_test.info('----------------------------------------------------------------------------------------------')
-                log_test.info("loss -> " + str(loss))
-                log_test.info(str(os.path.join(save_root, "{}_lab.png".format(root_name))))
-                log_test.info(str(os.path.join(save_root, "{}_pre.png".format(root_name))))
-                log_test.info('----------------------------------------------------------------------------------------------')
-                cv2.imwrite(os.path.join(save_root, "{}_lab.png".format(root_name)), target)
-                cv2.imwrite(os.path.join(save_root, "{}_pre.png".format(root_name)), out)
-                pbar.set_description(f"Loss: {loss.item():.4f}")
-                pbar.update(1)
-        pbar.close()
+                    log_test.info('----------------------------------------------------------------------------------------------')
+                    log_test.info("loss -> " + str(loss))
+                    log_test.info(str(os.path.join(save_root, "{}_lab.png".format(root_name))))
+                    log_test.info(str(os.path.join(save_root, "{}_pre.png".format(root_name))))
+                    log_test.info('----------------------------------------------------------------------------------------------')
+                    cv2.imwrite(os.path.join(save_root, "{}_lab.png".format(root_name)), target)
+                    cv2.imwrite(os.path.join(save_root, "{}_pre.png".format(root_name)), out)
+                    pbar.set_description(f"Loss: {loss.item():.4f}")
+                    pbar.update(1)
+            pbar.close()
 
-        log_test.info("model -> " + str(epoch) + " test finish!")
-        log_test.info('----------------------------------------------------------------------------------------------')
-        print("testing epoch finish -> ", epoch)
-        print("---------------------------------------------------------------------------------------")
+            log_test.info("model -> " + str(epoch) + " test finish!")
+            log_test.info('----------------------------------------------------------------------------------------------')
+            print("testing epoch finish -> ", epoch)
+            print("---------------------------------------------------------------------------------------")
 
-        print("evalauting epoch start -> ", epoch)
-        metrics = eval(log_eval, save_root, epoch)
-        for key, value in metrics.items():
-            print(str(key) + ' -> ' + str(value))
-        if(max_mIoU < metrics['mIoU']):
-            max_Metrics = metrics
-            max_mIoU = metrics['mIoU']
-            checkpoint_paths = [output_dir / f'checkpoint_best.pth']
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
-            log_train.info("\nupdate and save best model -> " + str(epoch))
-            print("\nupdate and save best model -> ", epoch)
+            print("evalauting epoch start -> ", epoch)
+            metrics = eval(log_eval, save_root, epoch)
+            for key, value in metrics.items():
+                print(str(key) + ' -> ' + str(value))
+                
+            # Extra: compute Dice from IoU
+            if 'mIoU' in metrics:
+                mDice = dice_from_iou(metrics['mIoU'])
+                print("mDice ->", mDice)
+                metrics['mDice'] = mDice
 
-        print("evalauting epoch finish -> ", epoch)
-        print('\nmax_mIoU -> ' + str(max_Metrics['mIoU']) + '\nmax Epoch -> ' + str(max_Metrics['epoch']))
-        print("---------------------------------------------------------------------------------------")
+            if(max_mIoU < metrics['mIoU']):
+                max_Metrics = metrics
+                max_mIoU = metrics['mIoU']
+                checkpoint_paths = [output_dir / f'checkpoint_best.pth']
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'args': args,
+                    }, checkpoint_path)
+                log_train.info("\nupdate and save best model -> " + str(epoch))
+                print("\nupdate and save best model -> ", epoch)
 
-        log_eval.info("evalauting epoch finish -> " + str(epoch))
-        log_eval.info('\nmax_mIoU -> ' + str(max_Metrics['mIoU']) + '\nmax Epoch -> ' + str(max_Metrics['epoch']))
-        log_eval.info("---------------------------------------------------------------------------------------")
+            print("evalauting epoch finish -> ", epoch)
+            print('\nmax_mIoU -> ' + str(max_Metrics['mIoU']) + '\nmax Epoch -> ' + str(max_Metrics['epoch']))
+            print("---------------------------------------------------------------------------------------")
+
+            log_eval.info("evalauting epoch finish -> " + str(epoch))
+            log_eval.info('\nmax_mIoU -> ' + str(max_Metrics['mIoU']) + '\nmax Epoch -> ' + str(max_Metrics['epoch']))
+            log_eval.info("---------------------------------------------------------------------------------------")
+
+        else:
+            print(f"Skipping evaluation for epoch {epoch}")
+            print("---------------------------------------------------------------------------------------")
+
 
     for key, value in max_Metrics.items():
         log_eval.info(str(key) + ' -> ' + str(value))

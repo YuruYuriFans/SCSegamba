@@ -7,3 +7,4 @@ __pycache__/
 /checkpoints
 stderr.txt
 stdout.txt
+results/
